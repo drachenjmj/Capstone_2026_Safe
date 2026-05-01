@@ -1,0 +1,346 @@
+ -----------------order_invoice_refunds-----------------
+sales_price_original = excl VAT
+sales_price_invoiced = actually invoiced excl VAT
+line_disocunt_amount = line_disocunt_amount / currency_factor (aufgrund von Rundungsfehlern nicht so clean)
+
+
+-----------------customers-----------------
+WITH
+customers               AS (SELECT * FROM {{ ref('base_kids_business_central_customer') }})
+, sales_person_base     AS (SELECT * FROM {{ ref('base_kids_business_central_salesperson_purchaser')}})
+, customer_matching     AS (SELECT * FROM {{ ref('base_kids_permissions_customers')}})
+, invoices_refunds      AS (SELECT * FROM {{ ref('derived_kids_order_invoices_refunds')}})
+, calendar              AS (SELECT * FROM {{ ref('derived_kids_calendar')}})
+, orders_aggregated     AS (SELECT * FROM {{ ref('fct_kids_orders_agg')}}) 
+, items                 AS (SELECT * FROM {{ ref('derived_kids_items')}})
+, crossengage_subs      AS (SELECT * FROM {{ ref('base_kids_newsletter_subscriptions')}})
+, salescluster          AS (SELECT * FROM {{ ref('derived_kids_sales_cluster')}})
+, customer_accounts     AS (SELECT * FROM {{ ref('base_kids_customer_accounts')}})
+, post_code             AS (SELECT * FROM {{ ref('base_kids_post_codes')}})
+
+, invoices_refunds_kids AS (
+  SELECT *
+  FROM invoices_refunds
+  WHERE company = 'KIDS'
+)
+
+-- calculate the average order value
+, average_order_value AS (
+  SELECT
+    customer_no
+    , ROUND(sum(net_amount - cost_amount))                                              AS total_cm1
+    , ROUND(sum(net_amount))                                                            AS total_order_value
+    , ROUND(SUM(IFF(
+        is_return_incl_indirect
+        , net_amount
+        , 0)))                                                                          AS total_return_value
+    , total_order_value - total_return_value                                            AS total_order_value_II
+    , ROUND(SUM(IFF(
+          is_return_incl_indirect
+          , net_amount - cost_amount
+          , 0)))                                                                        AS total_cm1_II
+    , SUM(IFF(discount_above_threshold = 'discount above threshold'
+        , discount_total, 0))                                                           AS total_discount_above_threshold
+    , ROUND(sum(quantity))                                                              AS qty_III
+    , ABS(ROUND(SUM(IFF(is_return_incl_indirect, quantity, 0))))                        AS qty_returned
+    , ROUND(SUM(IFF(main_category = 'BAGS'
+        AND NOT ir.is_return_incl_indirect, quantity, 0)))                              AS qty_bags_III
+    , ROUND(SUM(IFF(main_category = 'BAGS', quantity, 0)))                              AS qty_bags_II
+    , ROUND(SUM(IFF(main_category = 'FOOTWEAR'
+        AND NOT ir.is_return_incl_indirect, quantity, 0)))                              AS qty_footwear_III
+    , ROUND(SUM(IFF(main_category = 'FOOTWEAR', quantity, 0)))                          AS qty_footwear_II
+    , LISTAGG(DISTINCT i.brand, ' || ') WITHIN GROUP (ORDER BY i.brand)                 AS brands_II
+    , LISTAGG(DISTINCT i.main_category, ' || ') WITHIN GROUP (ORDER BY i.main_category) AS main_categories_II
+    , LISTAGG(DISTINCT i.sub_category, ' || ') WITHIN GROUP (ORDER BY i.sub_category)   AS sub_categories_II
+    , LISTAGG(DISTINCT i.product_type, ' || ') WITHIN GROUP (ORDER BY i.product_type)   AS product_types_II
+    , LISTAGG(DISTINCT i.appearance, ' || ') WITHIN GROUP (ORDER BY i.appearance)       AS appearances_II
+    , LISTAGG(DISTINCT ir.sales_channel, ' || ')
+        WITHIN GROUP (ORDER BY ir.sales_channel)                                        AS sales_channels_II
+    , ARRAY_AGG(DISTINCT
+        IFF(ir.order_date >= ADD_MONTHS(CURRENT_DATE(), -12), i.main_category, null))   AS main_categories_last_12_months
+  FROM invoices_refunds_kids ir
+  LEFT JOIN items i ON ir.item_no = i.item_no
+  WHERE sales_channel != 'Reklamation'
+  GROUP BY 1
+)
+
+-- check how many items a customer kept (after returns) per order
+, aggregated_invoice_data_per_customer_and_order AS (
+    SELECT customer_no, order_no, SUM(quantity)                                           AS qty_per_order
+    FROM invoices_refunds_kids
+    -- as they make everything more complex - e.g. customers that have only bought b2b, can make a 'Reklamation'
+    -- and then you will find them in the invoice number with
+    -- and order_number despite they never made an online-shop-sale
+    WHERE sales_channel != 'Reklamation'
+    GROUP BY 1, 2
+)
+
+, order_metrics_per_customer AS (
+    SELECT
+      customer_no
+      , COUNT(DISTINCT order_no)                                                          AS order_count
+      , COUNT(DISTINCT IFF(qty_per_order = 0, order_no, NULL))                            AS return_count_complete
+      , COUNT(DISTINCT IFF(qty_per_order != 0, order_no, NULL))                           AS order_count_after_complete_returns
+    FROM aggregated_invoice_data_per_customer_and_order
+    GROUP BY 1
+)
+
+-- calculate the number of invoices, corrections and returns per customer
+, aggregated_invoice_data_per_customer AS (
+  SELECT
+      oir.customer_no
+    , COUNT(DISTINCT IFF(
+        return_type = 'None' AND sales_channel != 'Reklamation'
+        , document_no, NULL))                                                           AS invoice_count_uncorrected
+    , COUNT(DISTINCT IFF(
+        return_type = 'Unclear' AND sales_channel != 'Reklamation'
+        , document_no, NULL))                                                           AS correction_count
+    , invoice_count_uncorrected - correction_count                                      AS invoice_count
+    , COUNT(DISTINCT IFF(
+        is_return_incl_indirect
+          AND sales_channel != 'Reklamation'
+        , document_no, NULL))                                                           AS return_count_partial_or_complete
+    , COUNT(DISTINCT IFF(sales_channel = 'Reklamation', document_no, NULL))             AS reklamation_count
+  FROM invoices_refunds_kids oir
+  GROUP BY 1
+)
+
+-- calculate the revenue per customer for the last 2 years to identify inactive customers
+, revenue_per_customer  AS (
+  SELECT
+    customer_no
+    , SUM(net_amount)                                       AS revenue_L2Y
+  FROM invoices_refunds_kids
+  WHERE posting_date >= DATEADD(day, -730, GETDATE())
+  GROUP BY 1
+)
+-- calculate if a customer made any revenue in the last financial year to identify new customers
+, revenue_per_customer_last_fy AS (
+  SELECT
+    customer_no
+    , SUM(net_amount)                                       AS revenue_last_fy
+  FROM invoices_refunds_kids ir
+  LEFT JOIN calendar c ON c.date = ir.posting_date
+  WHERE c.relative_to_current_fy = -1
+  GROUP BY 1
+)
+-- calculate if a customer made any revenue in the last financial year to identify reactivated customers
+, revenue_per_customer_two_fy_ago AS (
+  SELECT
+    customer_no
+    , SUM(net_amount)                                       AS revenue_fy_2yearsago
+  FROM invoices_refunds_kids ir
+  LEFT JOIN calendar c ON c.date = ir.posting_date
+  WHERE c.relative_to_current_fy = -2
+  GROUP BY 1
+)
+, dates_per_customer AS (
+    SELECT
+      customer_no
+      , MAX(posting_date)                                       AS last_invoice_date
+      , MAX(order_date)                                         AS last_order_date
+      , MIN(posting_date)                                       AS first_invoice_date
+      , MIN(order_date)                                         AS first_order_date
+    FROM invoices_refunds_kids ir
+    WHERE line_type = 'invoice'
+      AND sales_channel != 'Reklamation'
+    GROUP BY 1
+)
+, second_order_date_per_customer AS (
+    SELECT
+      ir.customer_no
+      , MIN(order_date)                                           AS second_order_date
+    FROM invoices_refunds_kids ir
+    LEFT JOIN dates_per_customer dpc ON dpc.customer_no = ir.customer_no
+    WHERE line_type = 'invoice'
+      AND sales_channel != 'Reklamation'
+      AND ir.order_date != dpc.first_order_date
+    GROUP BY 1
+)
+, OS_b2b_customer_check AS (
+    --only b2b customers that order in our online shop have access to these discount codes and can thereby be identified
+    SELECT
+     customer_no
+    FROM invoices_refunds_kids
+    WHERE discount_code is not null
+        AND (discount_code LIKE 'BB-AFZ-55-%'
+            OR discount_code LIKE 'BB-ERG-43-%'
+            OR discount_code LIKE 'BB-ERG-50-%'
+            OR discount_code LIKE 'BB-SAT-43-%'
+            OR discount_code LIKE 'BB-SAT-50-%'
+            OR discount_code LIKE 'FH-SAT-43-%'
+             )
+    GROUP BY 1
+
+)
+, final AS (
+  SELECT DISTINCT
+    c.customer_name
+    , c.customer_no
+    , CONCAT(
+          NVL(c.customer_no, '')
+        , ' - '
+        , NVL(c.customer_name, '')
+    )                                                       AS customer_no_name
+    , spm.sales_person_name                                 AS sales_person_name_move
+    , spb.sales_person_name                                 AS sales_person_name_bags
+    , spf.sales_person_name                                 AS sales_person_name_footwear
+    , cmm.power_bi_email                                    AS power_bi_email_move
+    , cmb.power_bi_email                                    AS power_bi_email_bags
+    , cmf.power_bi_email                                    AS power_bi_email_footwear
+    , NULLIF(c.blocked, ' ') IS NOT NULL                    AS is_blocked
+    , c.payment_method_code = 'VORKASSE'                    AS is_vorkasse
+    , c.blocked
+    , c.payment_method_code
+    , c.customer_type
+    , c.country_region_code
+    , c.post_code
+    , c.city
+    , rpc.revenue_L2Y IS NOT NULL                           AS is_active_in_L2Y
+    , c.customer_price_group_old
+    , IFF(rpclf.revenue_last_fy IS NULL
+        , 'not active last fy' 
+        , 'active last fy')                                 AS is_active_last_fy
+    , IFF(rp2ya.revenue_fy_2yearsago IS NULL
+        , 'not active two fy ago'
+        , 'active two fy ago')                              AS is_active_2fy_ago
+    , lo.last_invoice_date
+    , lo.last_order_date
+    , lo.first_invoice_date
+    , lo.first_order_date
+    , ca_fod.financial_year                                 AS fy_first_order_date
+    , sodpc.second_order_date
+    , sodpc.second_order_date - lo.first_order_date         AS days_first_to_second_order
+    , CASE
+        WHEN ooarpc.order_count > 2
+          THEN 'Serial Customer'
+        WHEN ooarpc.order_count > 1
+          THEN 'Repeat Customer'
+        ELSE 'One-time Customer' END                        AS customer_order_type
+    , CASE
+        WHEN ooarpc.order_count_after_complete_returns > 2
+          THEN 'Serial Customer Adj'
+        WHEN ooarpc.order_count_after_complete_returns > 1
+          THEN 'Repeat Customer Adj'
+        ELSE 'One-time Customer Adj' END                    AS customer_order_type_adj
+    , IFF(return_count_partial_or_complete > 0
+        , 'Returner'
+        , 'Non Returner')                                   AS customer_return_type
+    , ROUND(DIV0(total_order_value, ooarpc.order_count), 1) AS average_order_value
+    , ROUND(DIV0(total_cm1, ooarpc.order_count), 1)         AS average_cm1
+    , ROUND(
+        DIV0(
+          total_order_value_II
+          , ooarpc.order_count
+        ), 1)                                               AS average_order_value_II
+    , ROUND(
+        DIV0(
+          total_cm1_II
+          , ooarpc.order_count
+        ), 1)                                               AS average_cm1_II
+    , CURRENT_DATE() - first_order_date                     AS days_since_first_order
+    , CURRENT_DATE() - lo.last_order_date                   AS days_since_last_order
+    , CEIL(DIV0(days_since_first_order, 30))                AS months_since_first_order
+    , CEIL(DIV0(days_since_last_order, 30))                 AS months_since_last_order
+    , lo.last_order_date - first_order_date                 AS days_between_first_and_last_order
+    , ROUND(DIV0(
+        days_between_first_and_last_order
+        , (ooarpc.order_count - 1)))                        AS avg_days_between_orders -- its '- 1' because if somebody ordered two times and 30 days happened in between than the average time between the orders is 30 days (30/1) not 15 (30/2)
+    , ROUND(DIV0(ooarpc.order_count
+      , months_since_first_order), 1)                       AS avg_invoices_per_month
+    , ROUND(avg_invoices_per_month * average_cm1 * 36)      AS clv  -- 36 is supposed to be the average customer lifespan in months.. this should probably adapted based on the analysis and the brand a customer has primarily been buying.. and target group age
+    , total_cm1
+    , total_cm1_II
+    , total_order_value
+    , total_order_value_II
+    , total_return_value
+    , ROUND(
+        DIV0(
+          total_discount_above_threshold
+          , total_order_value + total_discount_above_threshold
+        )
+        , 2)                                               AS discount_share_per_customer
+    , total_discount_above_threshold
+    , qty_III
+    , qty_returned
+    , qty_bags_III
+    , qty_bags_II
+    , qty_footwear_III
+    , qty_footwear_II
+    , CASE
+        WHEN qty_footwear_III > 0 AND qty_bags_III > 0 THEN 'Footwear & Bags'
+        WHEN qty_footwear_III > 0 THEN 'Footwear'
+        WHEN qty_bags_III > 0 THEN 'Bags'
+        ELSE 'No Footwear or Bags after returns' END        AS has_bought_footwear_or_bags
+    , return_count_partial_or_complete
+    , ooarpc.return_count_complete                          AS return_count_complete
+    , ooarpc.order_count                                    AS order_count
+    , ooarpc.order_count_after_complete_returns             AS order_count_after_complete_returns
+    , reklamation_count
+    , aov.brands_II
+    , aov.sales_channels_II
+    , aov.main_categories_II
+    , aov.sub_categories_II
+    , aov.product_types_II
+    , aov.appearances_II
+    , aov.main_categories_last_12_months
+    , oa.order_brands                                       AS first_order_brands
+    , oa.order_main_categories                              AS first_order_main_categories
+    , oa.order_sub_categories                               AS first_order_sub_categories
+    , oa.order_product_types                                AS first_order_product_types
+    , oa.order_items                                        AS first_order_items
+    , oa.order_appearances                                  AS first_order_appearances
+    , oa.order_sales_amount_II_net                          AS first_order_net_amount_II
+    , oa.order_sales_amount_III_net                         AS first_order_net_amount_III
+    , oa.order_sales_amount_ii_gross                        AS first_order_gross_amount_II
+    , oa.order_sales_amount_III_gross                       AS first_order_gross_amount_III
+    , cs.is_subscribed_somewhere
+    , cs.is_subscribed_for
+    , cs.is_subscribed_for_affenzahn
+    , CASE WHEN os.customer_no IS NOT NULL THEN TRUE
+            ELSE FALSE END                                  AS is_OS_b2b_customer
+    , c.email_hashed
+    , c.customer_created_at
+    , sc.sales_person_code_bags
+    , sc.sales_person_code_footwear
+    , sc.sales_person_code_move
+    , sc.sales_person_code_baby
+    , sc.sales_person_code_all
+    , sc.cluster_type_code_all
+    , sc.cluster_type_code_bags
+    , sc.cluster_type_code_footwear
+    , sc.cluster_type_code_move
+    , sc.cluster_type_code_baby
+    , ca.email_hashed IS NOT NULL                           AS has_customer_account
+    , po.county_name
+    , po.state_name
+    , po.state_population
+  FROM customers c
+  LEFT JOIN revenue_per_customer rpc ON rpc.customer_no = c.customer_no
+  LEFT JOIN revenue_per_customer_last_fy rpclf ON rpclf.customer_no = c.customer_no
+  LEFT JOIN revenue_per_customer_two_fy_ago rp2ya ON rp2ya.customer_no = c.customer_no
+  LEFT JOIN dates_per_customer lo ON lo.customer_no = c.customer_no
+  LEFT JOIN aggregated_invoice_data_per_customer agg_oir_cu ON c.customer_no = agg_oir_cu.customer_no
+  LEFT JOIN aggregated_invoice_data_per_customer_and_order
+  LEFT JOIN average_order_value aov ON aov.customer_no = c.customer_no
+  LEFT JOIN calendar ca_fod ON ca_fod.date = lo.first_order_date
+  LEFT JOIN orders_aggregated oa ON oa.customer_no = c.customer_no AND order_no_per_customer = 1
+  LEFT JOIN crossengage_subs cs ON cs.email_hashed = c.email_hashed
+  LEFT JOIN second_order_date_per_customer sodpc ON sodpc.customer_no = c.customer_no
+  LEFT JOIN order_metrics_per_customer ooarpc ON ooarpc.customer_no = c.customer_no
+  LEFT JOIN salescluster sc ON sc.customer_no = c.customer_no
+  LEFT JOIN customer_matching cmm ON cmm.sales_person_code = sc.sales_person_code_move
+  LEFT JOIN customer_matching cmb ON cmb.sales_person_code = sc.sales_person_code_bags
+  LEFT JOIN customer_matching cmf ON cmf.sales_person_code = sc.sales_person_code_footwear
+  LEFT JOIN sales_person_base spm ON spm.sales_person_code = sc.sales_person_code_move
+  LEFT JOIN sales_person_base spb ON spb.sales_person_code = sc.sales_person_code_bags
+  LEFT JOIN sales_person_base spf ON spf.sales_person_code = sc.sales_person_code_footwear
+  LEFT JOIN customer_accounts ca ON ca.email_hashed = c.email_hashed
+  LEFT JOIN post_code po ON po.post_code = c.post_code
+  LEFT JOIN OS_b2b_customer_check os ON os.customer_no = c.customer_no
+)
+
+SELECT * FROM final
+
+
+----discoutn codes mitarbeitende

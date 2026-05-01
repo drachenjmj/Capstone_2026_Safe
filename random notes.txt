@@ -1,0 +1,23 @@
+CM1 als Basis für den CLV finde ich nicht so passend.
+
+"
+CM1= net_amount - cost_amount AS cm1 #deckungsbeitrag
+"
+ 
+CM1 Nicht berechenbar für uns one vollen Datenbankzugriff da CM1 = net_amount − cost_amount , cost_amount	FEHLT
+
+Der CM1 hängt ja davon ab welche Produkte ein Kunde kauft und welche Marge die haben,
+das ist aber eher ein Produkt-Thema, kein Kunden-Thema. 
+Ein Kunde der immer dieselbe Kauffrequenz und denselben Warenkorb hat kann trotzdem einen super unterschiedlichen CM1 haben, je nachdem ob grad ein Produkt mit hoher oder niedriger Marge dabei ist.
+ 
+Wenn ein Kunde immer Rabatt bekommt wäre das natürlich relevant,
+aber das wäre dann eher über den tatsächlichen Nettoumsatz in Kombination mit dem Rabatt-Anteil abzubilden, nicht über CM1.
+ 
+Für die CLV-Vorhersage würde ich lieber mit Revenue arbeiten. Das ist stabiler, direkter vom Kundenverhalten abhängig, und einfacher zu erklären.
+ 
+Die 36 Monate Annahme für die Customer Lifespan ist als erster Ansatz eigentlich gar nicht so schlecht. Aber wir könnten das im Laufe des Projekts flexibler gestalten,
+zum Beispiel basierend auf Schätzwerten zur Anzahl der Kinder im Haushalt und dem ungefähren Alter der Kinder.
+Dann wäre die angenommene Lifespan nicht mehr fix für alle Kunden gleich sondern würde sich daran orientieren wie lange ein Kunde noch in der relevanten Altersgruppe einkaufen wird.
+
+
+

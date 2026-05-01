@@ -1,0 +1,1 @@
+CUSTOMER_NO,ORDER_NO,ORDER_DATE,net_amount_order,qty_order,n_items,has_discount,discount_code,is_return_order,CUSTOMER_TYPE,COUNTRY_REGION_CODE,CUSTOMER_ORDER_TYPE,HAS_CUSTOMER_ACCOUNT,IS_SUBSCRIBED_FOR,order_rank

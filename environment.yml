@@ -1,0 +1,19 @@
+name: capstone-2026
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pandas
+  - numpy
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - jupyter
+  - notebook
+  - ipykernel
+  - snowflake-connector-python
+  - openpyxl
+  - pip
+  - pip:
+    - lifetimes
